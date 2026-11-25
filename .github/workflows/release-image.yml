@@ -22,9 +22,11 @@ jobs:
       - name: Pull & package & release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           chmod +x scripts/package-release.sh
-          ./scripts/package-release.sh \
-            --image "${{ inputs.image }}" \
-            --tag "${{ inputs.release_tag }}" \
-            --repo "${{ github.repository }}"
+          ARGS=(--image "${{ inputs.image }}" --repo "${{ github.repository }}")
+          if [[ -n "$RELEASE_TAG" ]]; then
+            ARGS+=(--tag "$RELEASE_TAG")
+          fi
+          ./scripts/package-release.sh "${ARGS[@]}"
