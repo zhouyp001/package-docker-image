@@ -4,8 +4,11 @@
 # 流程: docker pull -> docker save (tar/tar.gz) -> 发布到 GitHub Release
 #
 # 用法示例:
-#   ./scripts/package-release.sh -i nginx:1.25.3 -r owner/repo -t v1.25.3
+#   ./scripts/package-release.sh -i nginx:1.25.3 -r owner/repo
 #   ./scripts/package-release.sh            # 交互式输入镜像地址
+#
+# 未指定 --tag 时，发布 tag 默认使用镜像地址本身（已 sanitize 成合法 Git tag），
+# 例如 quay.io/keycloak/keycloak:latest -> quay.io_keycloak_keycloak_latest
 # =============================================================================
 set -euo pipefail
 
@@ -41,7 +44,9 @@ usage() {
 选项:
   -i, --image <ref>        镜像地址, 如 registry.example.com/app:1.2.3
                            (不传则交互式输入)
-  -t, --tag <tag>          GitHub Release tag, 默认从镜像 tag 推断
+  -t, --tag <tag>          GitHub Release tag, 默认使用镜像地址本身
+                           (sanitize 后, 如 quay.io/keycloak/keycloak:latest
+                            -> quay.io_keycloak_keycloak_latest)
   -r, --repo <owner/repo>  目标仓库, 默认 $GITHUB_REPOSITORY 或当前仓库
   -o, --output-dir <dir>   打包输出目录, 默认 ./dist
   -m, --mode <mode>        发布方式: github-release | local, 默认 github-release
@@ -61,12 +66,24 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -i|--image)      IMAGE="${2:?-i/--image 缺少参数}";       shift 2 ;;
-      -t|--tag)        RELEASE_TAG="${2:?-t/--tag 缺少参数}";   shift 2 ;;
+      -t|--tag)
+        if [[ -n "${2:-}" ]]; then
+          RELEASE_TAG="$2"; shift 2
+        else
+          shift
+        fi
+        ;;
       -r|--repo)       REPO="${2:?-r/--repo 缺少参数}";         shift 2 ;;
       -o|--output-dir) OUTPUT_DIR="${2:?-o/--output-dir 缺少参数}"; shift 2 ;;
       -m|--mode)       MODE="${2:?-m/--mode 缺少参数}";         shift 2 ;;
       --platform)      PLATFORM="${2:?--platform 缺少参数}";    shift 2 ;;
-      --notes)         NOTES="${2:?--notes 缺少参数}";          shift 2 ;;
+      --notes)
+        if [[ -n "${2:-}" ]]; then
+          NOTES="$2"; shift 2
+        else
+          shift
+        fi
+        ;;
       --no-compress)   COMPRESS="false"; shift ;;
       --dry-run)       DRY_RUN="true";   shift ;;
       -h|--help)       usage; exit 0 ;;
@@ -80,23 +97,23 @@ parse_args() {
 # ---------- 工具函数 ----------
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少依赖命令: $1"; }
 
-# 从镜像引用中取 tag: repo/name:1.2.3 -> 1.2.3
-get_image_tag() {
-  local ref="$1"
-  if [[ "$ref" == *"@sha256:"* ]]; then
-    local d="${ref##*@sha256:}"
-    printf 'sha%s' "${d:0:12}"
-    return
-  fi
-  local seg="${ref##*/}"
-  if [[ "$seg" == *:* ]]; then
-    printf '%s' "${seg##*:}"
-  fi
-}
-
-# 镜像名转安全文件名: registry.io/a/b:1.0 -> registry.io_a_b_1.0
+# 镜像名转安全字符串（用于文件名 / Release tag）
+# quay.io/keycloak/keycloak:latest -> quay.io_keycloak_keycloak_latest
 sanitize_name() {
   printf '%s' "$1" | sed -e 's|[@:]|_|g' -e 's|/|_|g'
+}
+
+# 将镜像地址转换为合法的 GitHub Release tag
+# 未指定 --tag 时使用。digest 形式会附加 sha 前缀短摘要。
+image_to_tag() {
+  local ref="$1"
+  if [[ "$ref" == *"@sha256:"* ]]; then
+    local base="${ref%%@*}"
+    local digest="${ref##*@sha256:}"
+    printf '%s-sha%s' "$(sanitize_name "$base")" "${digest:0:12}"
+    return
+  fi
+  sanitize_name "$ref"
 }
 
 hash_file() {
@@ -109,8 +126,13 @@ hash_file() {
   fi
 }
 
+# 注意：EXIT trap 的返回值会覆盖脚本退出码，
+# 因此必须保证 cleanup 在无临时文件时也返回 0。
 cleanup() {
-  [[ -n "$PARTIAL_FILE" && -f "$PARTIAL_FILE" ]] && rm -f "$PARTIAL_FILE"
+  if [[ -n "${PARTIAL_FILE:-}" && -f "$PARTIAL_FILE" ]]; then
+    rm -f "$PARTIAL_FILE"
+  fi
+  return 0
 }
 trap cleanup EXIT
 
@@ -125,9 +147,11 @@ collect_inputs() {
   fi
   [[ -n "$IMAGE" ]] || die "镜像地址不能为空"
 
+  # 未指定 --tag 时，直接使用镜像地址作为发布 tag
   if [[ -z "$RELEASE_TAG" ]]; then
-    RELEASE_TAG="$(get_image_tag "$IMAGE")"
+    RELEASE_TAG="$(image_to_tag "$IMAGE")"
   fi
+  # 兜底（正常不会触发）
   [[ -n "$RELEASE_TAG" ]] || RELEASE_TAG="$(date +%Y%m%d-%H%M%S)"
 
   log "镜像地址 : $IMAGE"
@@ -161,14 +185,14 @@ pull_image() {
   log "拉取镜像: docker ${args[*]}"
   if ! docker "${args[@]}"; then
     local registry="${IMAGE%%/*}"
-    # 镜像名里不含 registry 时 registry 就是 docker.io
+    # 镜像名里不含 registry 时，registry 就是 docker.io
     [[ "$registry" != *.* && "$registry" != *:* && "$registry" != "localhost" ]] && registry="docker.io"
 
     err "拉取镜像失败。常见原因:"
     err "  1. 镜像是私有的，但未登录 registry '$registry'"
     err "     本地:  docker login $registry"
     err "     CI  :  在 pull 前执行 docker login $registry --password-stdin"
-    err "  2. 账号无该镜像的访问权限（如 DHI 需订阅）"
+    err "  2. 账号无该镜像的访问权限"
     err "  3. 镜像 tag 不存在或已删除"
     die "请检查后重试"
   fi
@@ -243,6 +267,7 @@ publish_github_release() {
 | --- | --- |
 | Image | \`$IMAGE\` |
 | Digest | \`${digest:-n/a}\` |
+| Release Tag | \`$RELEASE_TAG\` |
 | File | \`$(basename "$ARCHIVE")\` |
 | SHA256 | \`$HASH\` |
 
@@ -274,12 +299,17 @@ EOF
   log "发布完成: https://github.com/$REPO/releases/tag/$RELEASE_TAG"
 }
 
+# 注意：summary 是 main 的最后一条命令，
+# 必须显式 return 0，否则条件为假时会以 1 退出。
 summary() {
   printf '\n'
   log "====== 完成 ======"
   log "镜像     : $IMAGE"
   log "Release  : $RELEASE_TAG"
-  [[ -n "$ARCHIVE" && -f "$ARCHIVE" ]] && log "产物     : $ARCHIVE"
+  if [[ -n "${ARCHIVE:-}" && -f "$ARCHIVE" ]]; then
+    log "产物     : $ARCHIVE"
+  fi
+  return 0
 }
 
 # ---------- 主流程 ----------
@@ -293,6 +323,7 @@ main() {
   gen_checksum
   publish
   summary
+  exit 0   # 显式声明成功，避免 EXIT trap 返回值影响退出码
 }
 
 main "$@"
