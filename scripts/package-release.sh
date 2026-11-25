@@ -159,7 +159,19 @@ pull_image() {
   args+=("$IMAGE")
 
   log "拉取镜像: docker ${args[*]}"
-  docker "${args[@]}"
+  if ! docker "${args[@]}"; then
+    local registry="${IMAGE%%/*}"
+    # 镜像名里不含 registry 时 registry 就是 docker.io
+    [[ "$registry" != *.* && "$registry" != *:* && "$registry" != "localhost" ]] && registry="docker.io"
+
+    err "拉取镜像失败。常见原因:"
+    err "  1. 镜像是私有的，但未登录 registry '$registry'"
+    err "     本地:  docker login $registry"
+    err "     CI  :  在 pull 前执行 docker login $registry --password-stdin"
+    err "  2. 账号无该镜像的访问权限（如 DHI 需订阅）"
+    err "  3. 镜像 tag 不存在或已删除"
+    die "请检查后重试"
+  fi
 }
 
 package_image() {

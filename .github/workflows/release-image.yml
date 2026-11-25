@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image:
-        description: '镜像地址，例如 nginx:1.25.3'
+        description: '镜像地址，例如 dhi.io/pgvector:0.8-pg18-debian-dev'
         required: true
       release_tag:
         description: 'Release tag（留空则自动推断）'
@@ -18,6 +18,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 关键：拉取前登录私有 registry
+      - name: Login to dhi.io
+        run: |
+          echo "${{ secrets.DHI_TOKEN }}" \
+            | docker login dhi.io \
+                --username "${{ secrets.DHI_USERNAME }}" \
+                --password-stdin
 
       - name: Pull & package & release
         env:
